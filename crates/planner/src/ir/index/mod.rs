@@ -16,6 +16,6 @@ pub use range::{
     RangeIndexLiteral, RangeIndexValue,
 };
 pub use search::{
-    RestrictedVectorSearchPlan, SearchIndexPlan, SearchTenantPlan, SearchTenantValuePlan,
-    SearchTenantValuePlanError,
+    RestrictedTextSearchPlan, RestrictedVectorSearchPlan, SearchIndexPlan, SearchTenantPlan,
+    SearchTenantValuePlan, SearchTenantValuePlanError,
 };

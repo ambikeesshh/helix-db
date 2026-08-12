@@ -779,16 +779,22 @@ const client = await Client.embedded({
 
 ## Configure caches
 
-Cache configuration is optional and fixed when the handle opens. Omit it to use these
-defaults:
+Cache configuration is optional and fixed when the handle opens. Local defaults are
+bounded and demand-filled so a small embedded database does not reserve server-sized
+caches:
 
-| Setting | Default |
-| --- | --- |
-| Profile | Memory |
-| Vector memory | 256 MiB, hydrated and refreshed in the background |
-| SlateDB | Default in-memory block and metadata caches, warmed in the background |
-| Full-text search | 64 MiB in-memory split cache, warmed in the background |
-| Disk cache | Disabled |
+| Setting | In-memory | Disk | Object storage |
+| --- | --- | --- | --- |
+| Durable-write flush interval | 1 ms | 3 ms | 100 ms |
+| Vector memory | 64 MiB | 64 MiB | 256 MiB |
+| SlateDB block / metadata | 16 MiB / 8 MiB | 48 MiB / 16 MiB | 512 MiB / 128 MiB |
+| Full-text search | 16 MiB | 16 MiB | 64 MiB |
+| SlateDB / FTS startup warming | Off | Off | Background |
+| Disk cache | Disabled | Disabled | Disabled |
+
+The local profiles also use a 16 MiB L0 target and a 64 MiB unflushed-data ceiling.
+The flush interval is the batching delay before storage I/O; filesystem and device
+latency still apply.
 
 Pass an explicit cache configuration to change the vector-memory budget or enable
 bounded disk caches:
@@ -2964,6 +2970,9 @@ by BM25 relevance. Project the rank field before traversing away from a hit.
 
 ## Next steps
 
+  <Card title="Full Text Search prefiltering" icon="filter" href="/database/helix-db/query-guides/filtering#full-text-search-prefiltering">
+    Rank only an exact traversal-defined candidate set.
+  </Card>
   <Card title="Project search results" icon="table-columns" href="/database/helix-db/query-guides/projections">
     Preserve ranked hit metadata before continuing a traversal.
   </Card>
@@ -3146,8 +3155,8 @@ Page type: Guide
 <div className="flex flex-wrap gap-2"><Badge color="blue" size="sm">Guide</Badge></div>
 
 Use a source predicate to select the initial candidates and `.where(...)` for
-expression-based filtering later in a traversal. Vector prefiltering applies the same
-idea to similarity search by ranking only an exact traversal-defined candidate set.
+expression-based filtering later in a traversal. Vector and full-text search
+prefiltering rank only an exact traversal-defined candidate set.
 
 ## Common predicates
 
@@ -3259,66 +3268,122 @@ This query requires an active three-dimensional cosine vector index on
 `Project.embedding`. Create and activate that index before running the request.
 
 ```rust Rust
-read_batch()
-    .var_as(
-        "matches",
-        g()
-            .n_with_label_where("User", SourcePredicate::eq("username", "alice"))
-            .out(Some("OWNS"))
-            .vector_search(
-                "Project",
-                "embedding",
-                vec![1.0f32, 0.0, 0.0],
-                5,
-                None,
-            )
-            .value_map(Some(vec!["$id", "name", "$distance"])),
-    )
-    .returning(["matches"]);
+use helix_db::dsl::prelude::*;
+
+#[query]
+fn owned_project_matches(
+    username: String,
+    query_vector: Vec<f32>,
+    limit: i64,
+) -> ReadBatch {
+    read_batch()
+        .var_as(
+            "matches",
+            g()
+                .n_with_label_where("User", SourcePredicate::eq("username", username))
+                .out(Some("OWNS"))
+                .vector_search_with("Project", "embedding", query_vector, limit, None)
+                .value_map(Some(vec!["$id", "name", "$distance"])),
+        )
+        .returning(["matches"])
+}
+
+let request = owned_project_matches(
+    "alice".to_string(),
+    vec![1.0f32, 0.0, 0.0],
+    5,
+)?;
 ```
 
 ```ts TypeScript
-readBatch()
+import {
+  SourcePredicate,
+  defineParams,
+  g,
+  param,
+  readBatch,
+} from "@helix-db/helix-db";
+
+const params = defineParams({
+  username: param.string(),
+  query_vector: param.array(param.f32()),
+  limit: param.i64(),
+});
+
+const query = readBatch()
   .varAs(
     "matches",
     g()
-      .nWithLabelWhere("User", SourcePredicate.eq("username", "alice"))
+      .nWithLabelWhere("User", SourcePredicate.eq("username", params.username))
       .out("OWNS")
-      .vectorSearch("Project", "embedding", [1, 0, 0], 5, null)
+      .vectorSearchWith("Project", "embedding", params.query_vector, params.limit)
       .valueMap(["$id", "name", "$distance"]),
   )
   .returning(["matches"]);
+
+const request = query.toQueryRequest(
+  params,
+  { username: "alice", query_vector: [1, 0, 0], limit: 5n },
+  { queryName: "owned_project_matches" },
+);
 ```
 
 ```go Go
-helix.ReadQuery("owned_project_matches").
+q := helix.ReadQuery("owned_project_matches")
+username := q.ParamString("username", "alice")
+queryVector := q.ParamArray(
+	"query_vector",
+	[]float32{1, 0, 0},
+	helix.ParamTypeF32(),
+)
+limit := q.ParamI64("limit", 5)
+
+request := q.
 	VarAs(
 		"matches",
 		helix.G().
-			NWithLabelWhere("User", helix.SourceEq("username", "alice")).
+			NWithLabelWhere("User", helix.SourceEq("username", username)).
 			Out("OWNS").
-			VectorSearchNodesWithin("Project", "embedding", []float32{1, 0, 0}, 5).
+			VectorSearchNodesWithin("Project", "embedding", queryVector, limit).
 			ValueMap("$id", "name", "$distance"),
 	).
 	Returning("matches")
 ```
 
 ```python Python
-(
+from helixdb import SourcePredicate, define_params, g, param, read_batch
+
+params = define_params({
+    "username": param.string(),
+    "query_vector": param.array(param.f32()),
+    "limit": param.i64(),
+})
+
+query = (
     read_batch()
     .var_as(
         "matches",
         g()
         .n_with_label_where(
-            "User", SourcePredicate.eq("username", "alice")
+            "User", SourcePredicate.eq("username", params.username)
         )
         .out("OWNS")
-        .vector_search(
-            "Project", "embedding", [1.0, 0.0, 0.0], 5
+        .vector_search_with(
+            "Project", "embedding", params.query_vector, params.limit
         )
         .value_map(["$id", "name", "$distance"]),
     )
     .returning(["matches"])
+)
+
+request = query.to_query_request(
+    params,
+    {
+        "username": "alice",
+        "query_vector": [1.0, 0.0, 0.0],
+        "limit": 5,
+    },
+    query_name="owned_project_matches",
 )
 ```
 
@@ -3351,7 +3416,7 @@ helix.ReadQuery("owned_project_matches").
                                 {
                                   "eq": {
                                     "left": { "property": "username" },
-                                    "right": { "constant": { "string": "alice" } }
+                                    "right": { "param": "username" }
                                   }
                                 }
                               ]
@@ -3364,10 +3429,8 @@ helix.ReadQuery("owned_project_matches").
                   },
                   "label": "Project",
                   "property": "embedding",
-                  "query_vector": {
-                    "value": { "f32_array": [1, 0, 0] }
-                  },
-                  "k": { "literal": 5 }
+                  "query_vector": { "expr": { "param": "query_vector" } },
+                  "k": { "expr": { "param": "limit" } }
                 }
               },
               "properties": ["$id", "name", "$distance"]
@@ -3377,12 +3440,24 @@ helix.ReadQuery("owned_project_matches").
       }],
       "returns": ["matches"]
     }
+  },
+  "parameters": {
+    "username": "alice",
+    "query_vector": [1, 0, 0],
+    "limit": 5
+  },
+  "parameter_types": {
+    "username": "string",
+    "query_vector": { "array": "f32" },
+    "limit": "i64"
   }
 }
 ```
 
-Use `VectorSearchEdgesWithin` in Go after an edge traversal. Rust, TypeScript, and
-Python select the node or edge wire operation from the current traversal state.
+Use `VectorSearchEdgesWithin` in Go after an edge traversal. Rust
+`vector_search_with`, TypeScript `vectorSearchWith`, and Python
+`vector_search_with` select the node or edge wire operation from the current stream.
+Their literal forms are `vector_search` and `vectorSearch`.
 
 ### Requirements
 
@@ -3402,6 +3477,232 @@ Use a source vector search when the whole indexed label and optional tenant part
 is the intended candidate set. Use vector prefiltering when relationships,
 permissions, or earlier filters define membership.
 
+## Full Text Search prefiltering
+
+Full-text search (FTS) prefiltering starts with a node or edge traversal, then ranks
+only the unique IDs in that stream by BM25 score. Use it when relationships,
+permissions, or earlier predicates define which records are eligible for text search.
+
+The execution order is **graph traversal → exact candidate membership → BM25 ranking
+→ top k**. Results are identical to an exhaustive BM25 search of the selected tenant
+partition, intersected with the candidate IDs, followed by deterministic top-k
+selection. BM25 statistics still come from the full tenant partition.
+
+### Rank a node stream
+
+This request finds documents the current user can read, ranks that exact set for
+`"graph databases"`, and returns the top five.
+
+This query requires an active text index on `Document.body`. Create and activate that
+index before running the request.
+
+```rust Rust
+use helix_db::dsl::prelude::*;
+
+#[query]
+fn readable_document_matches(
+    username: String,
+    query_text: String,
+    limit: i64,
+) -> ReadBatch {
+    read_batch()
+        .var_as(
+            "matches",
+            g()
+                .n_with_label_where("User", SourcePredicate::eq("username", username))
+                .out(Some("CAN_READ"))
+                .text_search_with("Document", "body", query_text, limit, None)
+                .value_map(Some(vec!["$id", "title", "$score"])),
+        )
+        .returning(["matches"])
+}
+
+let request = readable_document_matches(
+    "alice".to_string(),
+    "graph databases".to_string(),
+    5,
+)?;
+```
+
+```ts TypeScript
+import {
+  SourcePredicate,
+  defineParams,
+  g,
+  param,
+  readBatch,
+} from "@helix-db/helix-db";
+
+const params = defineParams({
+  username: param.string(),
+  query_text: param.string(),
+  limit: param.i64(),
+});
+
+const query = readBatch()
+  .varAs(
+    "matches",
+    g()
+      .nWithLabelWhere("User", SourcePredicate.eq("username", params.username))
+      .out("CAN_READ")
+      .textSearchWith("Document", "body", params.query_text, params.limit)
+      .valueMap(["$id", "title", "$score"]),
+  )
+  .returning(["matches"]);
+
+const request = query.toQueryRequest(
+  params,
+  { username: "alice", query_text: "graph databases", limit: 5n },
+  { queryName: "readable_document_matches" },
+);
+```
+
+```go Go
+q := helix.ReadQuery("readable_document_matches")
+username := q.ParamString("username", "alice")
+queryText := q.ParamString("query_text", "graph databases")
+limit := q.ParamI64("limit", 5)
+
+request := q.
+	VarAs(
+		"matches",
+		helix.G().
+			NWithLabelWhere("User", helix.SourceEq("username", username)).
+			Out("CAN_READ").
+			TextSearchNodesWithin("Document", "body", queryText, limit).
+			ValueMap("$id", "title", "$score"),
+	).
+	Returning("matches")
+```
+
+```python Python
+from helixdb import SourcePredicate, define_params, g, param, read_batch
+
+params = define_params({
+    "username": param.string(),
+    "query_text": param.string(),
+    "limit": param.i64(),
+})
+
+query = (
+    read_batch()
+    .var_as(
+        "matches",
+        g()
+        .n_with_label_where(
+            "User", SourcePredicate.eq("username", params.username)
+        )
+        .out("CAN_READ")
+        .text_search_with(
+            "Document", "body", params.query_text, params.limit
+        )
+        .value_map(["$id", "title", "$score"]),
+    )
+    .returning(["matches"])
+)
+
+request = query.to_query_request(
+    params,
+    {
+        "username": "alice",
+        "query_text": "graph databases",
+        "limit": 5,
+    },
+    query_name="readable_document_matches",
+)
+```
+
+```json JSON
+{
+  "request_type": "read",
+  "query_name": "readable_document_matches",
+  "query": {
+    "read": {
+      "entries": [{
+        "query": {
+          "name": "matches",
+          "root": {
+            "value_map": {
+              "input": {
+                "text_search_nodes_within": {
+                  "input": {
+                    "out": {
+                      "input": {
+                        "nodes_where": {
+                          "predicate": {
+                            "and": {
+                              "predicates": [
+                                {
+                                  "eq": {
+                                    "left": { "property": "$label" },
+                                    "right": { "constant": { "string": "User" } }
+                                  }
+                                },
+                                {
+                                  "eq": {
+                                    "left": { "property": "username" },
+                                    "right": { "param": "username" }
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      },
+                      "label": "CAN_READ"
+                    }
+                  },
+                  "label": "Document",
+                  "property": "body",
+                  "query_text": { "expr": { "param": "query_text" } },
+                  "k": { "expr": { "param": "limit" } }
+                }
+              },
+              "properties": ["$id", "title", "$score"]
+            }
+          }
+        }
+      }],
+      "returns": ["matches"]
+    }
+  },
+  "parameters": {
+    "username": "alice",
+    "query_text": "graph databases",
+    "limit": 5
+  },
+  "parameter_types": {
+    "username": "string",
+    "query_text": "string",
+    "limit": "i64"
+  }
+}
+```
+
+Use `TextSearchEdgesWithin` in Go after an edge traversal. Rust
+`text_search_with`, TypeScript `textSearchWith`, and Python `text_search_with`
+select the node or edge wire operation from the current stream. Their literal forms
+are `text_search` and `textSearch`.
+
+### Result contract
+
+- Output IDs are a deduplicated subset of the input IDs.
+- The result contains at most `min(unique candidates, k)` rows.
+- Rows are ordered by BM25 score descending, then entity ID ascending.
+- The selected input row keeps its bindings, path, and sack; `$score` is attached.
+- Empty input returns without opening the text index.
+- A wrong-kind input or more than 1,000,000 unique candidates is a query error.
+- A tenant-partitioned index requires the same tenant value used to build the
+  candidate stream.
+
+### When to search without a prefilter
+
+Use a source text search when the whole indexed label and optional tenant partition
+is the intended candidate set. Do not implement exact FTS filtering as source text
+search followed by `.where(...)`: excluded high-scoring hits can consume the source
+top-k and leave fewer than `k` eligible results. Build the candidate stream first and
+use FTS prefiltering when membership is authoritative.
+
 ## Next steps
 
   <Card title="Typed parameters" icon="sliders" href="/database/helix-db/query-guides/parameters">
@@ -3412,6 +3713,9 @@ permissions, or earlier filters define membership.
   </Card>
   <Card title="Vector indexes" icon="circle-nodes" href="/database/helix-db/query-guides/vector-indexes">
     Create the dimensioned index used for ranking.
+  </Card>
+  <Card title="Text indexes" icon="align-left" href="/database/helix-db/query-guides/text-indexes">
+    Create the BM25 index used for full-text ranking.
   </Card>
   <Card title="Project search results" icon="table-columns" href="/database/helix-db/query-guides/projections">
     Preserve ranked hit metadata before continuing a traversal.
@@ -4169,7 +4473,7 @@ export const ClaudeCodeLogo = () => (
 
 The hosted HelixDB MCP server gives agents read-only access to your Helix Cloud
 workspaces, projects, databases, query insights, latency, recommendations,
-usage, and dedicated-cluster health.
+active indexes, usage, and dedicated-cluster health.
 
 - It uses browser-based OAuth through WorkOS. You do not create or copy an API key.
 - It returns only resources your Helix user can currently access.
@@ -4351,6 +4655,7 @@ After connecting, ask your agent to:
 - “Find my slowest queries over the last 24 hours and summarize their planner findings.”
 - “Compare p50, p95, and p99 query latency for this database.”
 - “List current query recommendations, grouped by severity.”
+- “List the active indexes the planner can use for this database.”
 - “Check CPU, memory, storage, and topology for this dedicated cluster.”
 
 ## Available tools
@@ -4360,11 +4665,33 @@ After connecting, ask your agent to:
 | `helix_list_workspaces` | List active workspaces the signed-in user can access. |
 | `helix_list_projects` | List active projects in an authorized workspace. |
 | `helix_list_databases` | List dedicated clusters and tenant databases in an authorized project. |
+| `helix_list_database_indexes` | List the writer-authoritative active indexes visible to the planner for a cluster or tenant database. |
 | `helix_get_query_insights` | Get query counts, failures, average/maximum latency, and typed planner findings. It does not return percentiles. |
 | `helix_get_query_latency` | Get authoritative p50, p95, p99, and maximum query latency. |
 | `helix_list_query_recommendations` | List structured recommendations without raw recommendation bodies. |
 | `helix_get_database_usage` | Get hourly or daily read and write counts for a cluster or tenant database. |
 | `helix_get_cluster_health` | Get CPU, memory, storage, and topology for a dedicated cluster. Components report availability independently. |
+
+### Active index inventory
+
+`helix_list_database_indexes` accepts a database reference such as
+`tenant:<id>` or `cluster:<id>`. It returns `content_trust`, `database`,
+`observed_at`, and an ordered `indexes` array. Every index contains:
+
+- `index_id`
+- `element`: `node` or `edge`
+- `kind`: `equality`, `range`, `vector`, or `full_text`
+- `label`
+- `property`
+
+The response includes `unique` only for node equality indexes, including when
+its value is `false`. It includes `direction` only for range indexes and
+`tenant_property` only for scoped vector or full-text indexes.
+
+The inventory contains only indexes that are active and visible to the planner
+at `observed_at`. Pending, building, failed, and dropped indexes are not
+included. An empty `indexes` array means no active indexes were visible; it
+does not report lifecycle state for inactive indexes.
 
 ## Troubleshooting
 

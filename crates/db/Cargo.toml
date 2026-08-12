@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-slatedb = { git = "https://github.com/HelixDB/slatedb.git", rev = "aa8a76c6e933d811fd811c296e86b067665e97f5" }
+slatedb = { git = "https://github.com/HelixDB/slatedb.git", rev = "dfe4b4dc38609db8b3fe8dc6f2d3de64bfe63f0e" }
 helix-ast = { path = "../ast" }
 helix-planner = { path = "../planner" }
 helix-value-semantics = { path = "../value-semantics" }
@@ -87,6 +87,10 @@ name = "write_path_mutations"
 harness = false
 
 [[bench]]
+name = "embedded_write_latency"
+harness = false
+
+[[bench]]
 name = "secondary_equality_hot_path"
 harness = false
 required-features = ["production-coverage"]
@@ -108,6 +112,11 @@ required-features = [
     "production-coverage",
     "index-lifecycle-testing",
 ]
+
+[[bench]]
+name = "fts_prefilter"
+harness = false
+required-features = ["production-coverage"]
 
 [[test]]
 name = "production_internal_contracts"
