@@ -473,3 +473,227 @@ fn a_present_but_unspawnable_runtime_keeps_its_command_error() {
         );
     }
 }
+
+/// Shared scaffold for the unverified-adoption warning tests: a hash-suffixed
+/// instance whose legacy resource set exists in the fake runtime.
+fn unverified_adoption_project(
+    fixture: &CliFixture,
+    server: &MockServer,
+    dir: &str,
+) -> std::path::PathBuf {
+    let project = fixture.root().join(dir);
+    fixture
+        .command()
+        .args(["init", "--path"])
+        .arg(&project)
+        .args(["local", "--port"])
+        .arg(server.address().port().to_string())
+        .args(["--disk", "--no-skills"])
+        .assert()
+        .success();
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+    let config_path = project.join("helix.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        config.replace("[local.dev]", &format!("[local.{instance}]")),
+    )
+    .unwrap();
+    project
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fully_unlabeled_legacy_adoption_warns_once_with_docs_link() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let fixture = CliFixture::new_with_fake_runtime();
+    let project = unverified_adoption_project(&fixture, &server, "unverified-warn-project");
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+
+    let out = stdout(
+        fixture
+            .command()
+            .current_dir(&project)
+            .env("HELIX_TEST_RUNTIME_VOLUME_MODE", "existing")
+            .args(["start", instance])
+            .assert()
+            .success(),
+    );
+
+    let legacy = "helix-unverified-warn-project-14527b3cbdf37376ceb9eda41d2afac4";
+    let log = fixture.runtime_log();
+    assert!(
+        log.contains(&format!("--name {legacy} -p")),
+        "fully unlabeled legacy resources must still be adopted, got: {log}"
+    );
+    assert!(
+        !log.contains(&format!("network rm {legacy}-net")),
+        "warning-only adoption must not remove the network, got: {log}"
+    );
+    assert!(
+        !log.contains(&format!("volume rm {legacy}-minio-data")),
+        "warning-only adoption must not remove the persistent volume, got: {log}"
+    );
+    assert!(
+        out.contains("could not be verified"),
+        "adoption without labels must warn, got: {out}"
+    );
+    assert!(
+        out.contains("docs.helix-db.com/cli/troubleshooting#legacy-resources-adopted-without-ownership-labels"),
+        "warning must link the troubleshooting docs, got: {out}"
+    );
+    assert_eq!(
+        out.matches("could not be verified").count(),
+        1,
+        "one command must warn once even though the name resolves repeatedly, got: {out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mixed_unlabeled_and_correct_labels_still_warn() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let fixture = CliFixture::new_with_fake_runtime();
+    let project = unverified_adoption_project(&fixture, &server, "mixed-warn-project");
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+    let identity = format!("18:mixed-warn-project/{instance}");
+
+    let out = stdout(
+        fixture
+            .command()
+            .current_dir(&project)
+            .env("HELIX_TEST_RUNTIME_CONTAINER_LABEL", &identity)
+            .env("HELIX_TEST_RUNTIME_VOLUME_MODE", "existing")
+            .args(["start", instance])
+            .assert()
+            .success(),
+    );
+
+    let legacy = "helix-mixed-warn-project-14527b3cbdf37376ceb9eda41d2afac4";
+    let log = fixture.runtime_log();
+    assert!(
+        log.contains(&format!("--name {legacy} -p")),
+        "unlabeled+correct resources must still be adopted, got: {log}"
+    );
+    assert!(
+        out.contains("could not be verified"),
+        "partially unlabeled adoption must warn, got: {out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fully_labeled_legacy_adoption_does_not_warn() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let fixture = CliFixture::new_with_fake_runtime();
+    let project = unverified_adoption_project(&fixture, &server, "verified-quiet-project");
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+    let identity = format!("22:verified-quiet-project/{instance}");
+
+    let out = stdout(
+        fixture
+            .command()
+            .current_dir(&project)
+            .env("HELIX_TEST_RUNTIME_LABEL_PROBE", &identity)
+            .args(["start", instance])
+            .assert()
+            .success(),
+    );
+
+    let legacy = "helix-verified-quiet-project-14527b3cbdf37376ceb9eda41d2afac4";
+    let log = fixture.runtime_log();
+    assert!(
+        log.contains(&format!("--name {legacy} -p")),
+        "fully labeled legacy resources must be adopted, got: {log}"
+    );
+    assert!(
+        !out.contains("could not be verified"),
+        "verified adoption must stay quiet, got: {out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_rejection_emits_no_unverified_adoption_warning() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let fixture = CliFixture::new_with_fake_runtime();
+    let project = unverified_adoption_project(&fixture, &server, "foreign-quiet-project");
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+
+    let out = stdout(
+        fixture
+            .command()
+            .current_dir(&project)
+            .env("HELIX_TEST_RUNTIME_LABEL_PROBE", "3:a b/dev")
+            .args(["start", instance])
+            .assert()
+            .success(),
+    );
+
+    let legacy = "helix-foreign-quiet-project-14527b3cbdf37376ceb9eda41d2afac4";
+    let log = fixture.runtime_log().replace('\r', "");
+    assert!(
+        !log.contains(&format!("--name {legacy} -p")),
+        "foreign-labeled resources must not be adopted, got: {log}"
+    );
+    assert!(
+        !out.contains("could not be verified"),
+        "rejected adoption must not print the unverified-adoption warning, got: {out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_warning_repeats_on_a_later_invocation() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/healthz"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..)
+        .mount(&server)
+        .await;
+
+    let fixture = CliFixture::new_with_fake_runtime();
+    let project = unverified_adoption_project(&fixture, &server, "repeat-warn-project");
+    let instance = "14527b3cbdf37376ceb9eda41d2afac4";
+
+    for invocation in ["first", "second"] {
+        let out = stdout(
+            fixture
+                .command()
+                .current_dir(&project)
+                .env("HELIX_TEST_RUNTIME_VOLUME_MODE", "existing")
+                .args(["start", instance])
+                .assert()
+                .success(),
+        );
+        assert_eq!(
+            out.matches("could not be verified").count(),
+            1,
+            "{invocation} invocation must warn exactly once, got: {out}"
+        );
+    }
+}

@@ -31,6 +31,32 @@ Project `read`/`write` does not grant database-data access. Ask an owner/admin t
 Run `helix start <instance>`, verify with `helix status <instance>`, or pass local-only `--host` and
 `--port` overrides.
 
+## Legacy resources adopted without ownership labels
+
+After upgrading, `helix start` may warn that legacy Docker resources were adopted but ownership
+could not be verified. Resources created before Helix labeled them carry no `helixdb.identity`
+label, so the CLI keeps using them for backward compatibility while telling you the provenance
+is unproven. A resource labeled for a different project is never adopted.
+
+Inspect what was adopted:
+
+```bash
+docker inspect --format '{{if .Config.Labels}}{{index .Config.Labels "helixdb.identity"}}{{end}}' <container>
+docker network inspect --format '{{if .Labels}}{{index .Labels "helixdb.identity"}}{{end}}' <network>
+docker volume inspect --format '{{if .Labels}}{{index .Labels "helixdb.identity"}}{{end}}' <volume>
+```
+
+An empty result means unlabeled (adopted best-effort); a value like `7:my-project/dev` names the
+owning project and instance. If every resource belongs to this project, no action is needed:
+the warning repeats on later commands only while some resource stays unlabeled, and Helix
+recreates containers with labels on each start. If you want the whole set labeled, back up
+any data first, then run `helix prune <instance>` followed by `helix start <instance> --disk`
+for a fresh labeled volume and network.
+
+Never treat an unlabeled resource as yours when ownership is uncertain: adopting or deleting
+another project's volume can hide data or make it unreachable. When in doubt, leave the
+resources alone and ask the other project owner to confirm.
+
 ## Cloud logs
 
 Cloud `--follow` is not supported. Use an RFC 3339 `--start`/`--end` range or omit both for the last

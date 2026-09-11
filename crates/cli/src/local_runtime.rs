@@ -16,6 +16,10 @@ use tokio::process::Command as TokioCommand;
 
 pub const CONTAINER_PORT: u16 = 8080;
 const IDENTITY_LABEL: &str = "helixdb.identity";
+/// Where users can verify an unverified legacy adoption and learn how to
+/// confirm ownership safely. Keep stable: it is printed by the adoption warning.
+pub const LEGACY_UNVERIFIED_DOCS_URL: &str =
+    "https://docs.helix-db.com/cli/troubleshooting#legacy-resources-adopted-without-ownership-labels";
 const CONTAINER_OWNER_FORMAT: &str =
     r#"{{if .Config.Labels}}{{index .Config.Labels "helixdb.identity"}}{{end}}"#;
 const RESOURCE_OWNER_FORMAT: &str = r#"{{if .Labels}}{{index .Labels "helixdb.identity"}}{{end}}"#;
@@ -181,13 +185,31 @@ impl LocalRuntime {
     }
 
     pub fn container_name(&self, instance_name: &str) -> String {
+        self.resolve_legacy_name(instance_name).0
+    }
+
+    /// Resolve the Docker resource base name and, for hash-suffixed legacy
+    /// names, whether the adopted set is fully ownership-proven.
+    ///
+    /// Exactly one Docker probe set per call. Command entry points resolve
+    /// once, warn at most once from that result, and reuse the name below
+    /// instead of resolving again, so one command never warns twice while
+    /// separate invocations (new processes) warn again.
+    fn resolve_legacy_name(&self, instance_name: &str) -> (String, LegacyAdoption) {
         let name = format!("{}-{}", self.project_name, instance_name);
         let identity = self.instance_identity(instance_name);
         let sanitized = sanitize_docker_name(&name);
-        let adopts = sanitized == name
-            && ends_with_hash_suffix(&sanitized)
-            && self.adopts_legacy_name(&format!("helix-{name}"), &identity);
-        compose_resource_name(&name, &identity, adopts)
+        if sanitized != name || !ends_with_hash_suffix(&sanitized) {
+            return (
+                compose_resource_name(&name, &identity, false),
+                LegacyAdoption::NotAdopted,
+            );
+        }
+        let adoption = self.legacy_adoption_status(&format!("helix-{name}"), &identity);
+        (
+            compose_resource_name(&name, &identity, adoption != LegacyAdoption::NotAdopted),
+            adoption,
+        )
     }
 
     fn instance_identity(&self, instance_name: &str) -> String {
@@ -199,28 +221,66 @@ impl LocalRuntime {
         )
     }
 
-    fn adopts_legacy_name(&self, legacy: &str, identity: &str) -> bool {
+    /// Whether the legacy resource set exists and who it belongs to.
+    ///
+    /// Split out from name resolution so callers can tell an
+    /// unverified adoption (some existing resource has no ownership label)
+    /// apart from a fully verified one without re-running the inspects.
+    /// Foreign-owner rejection is unchanged: any foreign label yields
+    /// [`LegacyAdoption::NotAdopted`].
+    fn legacy_adoption_status(&self, legacy: &str, identity: &str) -> LegacyAdoption {
         let minio = format!("{legacy}-minio");
         let network = format!("{legacy}-net");
         let volume = format!("{legacy}-minio-data");
-        let mut found = false;
-        for (kind, owner_format, resource) in [
-            ("container", CONTAINER_OWNER_FORMAT, legacy),
-            ("container", CONTAINER_OWNER_FORMAT, &minio),
-            ("network", RESOURCE_OWNER_FORMAT, &network),
-            ("volume", RESOURCE_OWNER_FORMAT, &volume),
-        ] {
-            let Some(owner) =
-                self.resource_label(&[kind, "inspect", "--format", owner_format, resource])
-            else {
-                continue;
-            };
-            if !owner.is_empty() && owner != identity {
-                return false;
-            }
-            found = true;
+        let owners = [
+            self.resource_label(&[
+                "container",
+                "inspect",
+                "--format",
+                CONTAINER_OWNER_FORMAT,
+                legacy,
+            ]),
+            self.resource_label(&[
+                "container",
+                "inspect",
+                "--format",
+                CONTAINER_OWNER_FORMAT,
+                &minio,
+            ]),
+            self.resource_label(&[
+                "network",
+                "inspect",
+                "--format",
+                RESOURCE_OWNER_FORMAT,
+                &network,
+            ]),
+            self.resource_label(&[
+                "volume",
+                "inspect",
+                "--format",
+                RESOURCE_OWNER_FORMAT,
+                &volume,
+            ]),
+        ];
+        classify_legacy_owners(
+            [
+                owners[0].as_deref(),
+                owners[1].as_deref(),
+                owners[2].as_deref(),
+                owners[3].as_deref(),
+            ],
+            identity,
+        )
+    }
+
+    /// Warn when a resolved legacy adoption is unverified. Call once per
+    /// command entry point with the result of [`Self::resolve_legacy_name`]:
+    /// one command warns at most once, while separate invocations warn again
+    /// because nothing is persisted.
+    fn warn_if_unverified(instance_name: &str, base_name: &str, adoption: LegacyAdoption) {
+        if adoption == LegacyAdoption::Unverified {
+            crate::output::warning(&legacy_unverified_warning(instance_name, base_name));
         }
-        found
     }
 
     fn resource_label(&self, args: &[&str]) -> Option<String> {
@@ -265,7 +325,8 @@ impl LocalRuntime {
         Self::check_available(self.runtime)?;
         self.pull_image(config)?;
 
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let image = config.image_ref();
         let _ = self.remove_container(&name);
         let (network, mut env) = if config.storage.is_disk() {
@@ -313,7 +374,8 @@ impl LocalRuntime {
         Self::check_available(self.runtime)?;
         self.pull_image(config)?;
 
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let image = config.image_ref();
         let _ = self.remove_container(&name);
         let (network, mut env) = if config.storage.is_disk() {
@@ -382,7 +444,8 @@ impl LocalRuntime {
 
     pub fn stop(&self, instance_name: &str) -> Result<bool> {
         Self::check_available(self.runtime)?;
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let removed_helix = self.remove_container(&name)?;
         let removed_disk_resources = self.remove_disk_resources(instance_name, false)?;
         Ok(removed_helix || removed_disk_resources)
@@ -394,7 +457,7 @@ impl LocalRuntime {
         }
 
         Self::check_available(self.runtime)?;
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
         let output = self
             .runtime_command()
             .args(["restart", &name])
@@ -402,6 +465,9 @@ impl LocalRuntime {
             .map_err(|e| eyre!("Failed to restart {name}: {e}"))?;
 
         if output.status.success() {
+            // Warn here rather than above: the fallback below warns inside
+            // `run_detached`, so warning up front would print twice.
+            Self::warn_if_unverified(instance_name, &name, adoption);
             self.wait_ready(config.port)?;
             return Ok(());
         }
@@ -416,7 +482,8 @@ impl LocalRuntime {
     // distinction and reports "not installed" for a binary that's present but, say, not
     // executable.
     pub fn logs(&self, instance_name: &str, follow: bool) -> Result<()> {
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let mut command = self.runtime_command();
         command.arg("logs");
         if follow {
@@ -446,7 +513,8 @@ impl LocalRuntime {
     }
 
     pub fn status(&self, instance_name: &str) -> Result<Option<LocalStatus>> {
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let output = self
             .runtime_command()
             .args([
@@ -489,7 +557,8 @@ impl LocalRuntime {
     }
 
     pub fn prune_instance(&self, instance_name: &str) -> Result<bool> {
-        let name = self.container_name(instance_name);
+        let (name, adoption) = self.resolve_legacy_name(instance_name);
+        Self::warn_if_unverified(instance_name, &name, adoption);
         let removed_helix = self.remove_container(&name)?;
         let removed_disk_resources = self.remove_disk_resources(instance_name, true)?;
         Ok(removed_helix || removed_disk_resources)
@@ -1312,6 +1381,52 @@ fn sanitize_docker_name(name: &str) -> String {
         .collect()
 }
 
+/// Whether a legacy Docker resource set can be adopted, and how much of its
+/// ownership could be proven from `helixdb.identity` labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyAdoption {
+    /// No legacy set exists, or a foreign label rejected the adoption.
+    NotAdopted,
+    /// Adopted and every existing resource carries this project's identity.
+    Verified,
+    /// Adopted, but at least one existing resource has no label, so ownership
+    /// could not be fully proven. Never produced when any resource is foreign.
+    Unverified,
+}
+
+/// Pure ownership classifier behind [`LocalRuntime::legacy_adoption_status`].
+/// `owners` holds one entry per probed resource in adoption order: `None` is
+/// missing, `Some("")` is unlabeled, otherwise the label value.
+fn classify_legacy_owners(owners: [Option<&str>; 4], identity: &str) -> LegacyAdoption {
+    let mut found = false;
+    for owner in owners.into_iter().flatten() {
+        if !owner.is_empty() && owner != identity {
+            return LegacyAdoption::NotAdopted;
+        }
+        found = true;
+    }
+    if !found {
+        return LegacyAdoption::NotAdopted;
+    }
+    if owners.into_iter().flatten().any(str::is_empty) {
+        LegacyAdoption::Unverified
+    } else {
+        LegacyAdoption::Verified
+    }
+}
+
+/// One-line, non-interactive warning for an unverified legacy adoption.
+/// Points at the docs for inspection steps; deliberately action-free so
+/// `status`/`logs` and non-interactive runs stay safe.
+fn legacy_unverified_warning(instance_name: &str, legacy: &str) -> String {
+    format!(
+        "Legacy resources for '{instance_name}' ({legacy}) were adopted, but ownership \
+         could not be verified: some resources have no helixdb.identity label. Check \
+         `docker inspect` labels and confirm they belong to this project before trusting \
+         their data. See {LEGACY_UNVERIFIED_DOCS_URL}"
+    )
+}
+
 fn compose_resource_name(name: &str, identity: &str, adopts_legacy: bool) -> String {
     let sanitized = sanitize_docker_name(name);
     if sanitized == name && (!ends_with_hash_suffix(&sanitized) || adopts_legacy) {
@@ -1386,6 +1501,59 @@ mod tests {
             compose_resource_name("demo-dev-14527b3cbdf37376ceb9eda41d2afac4", identity, true),
             "helix-demo-dev-14527b3cbdf37376ceb9eda41d2afac4"
         );
+    }
+
+    #[test]
+    fn legacy_adoption_states_distinguish_verified_from_unverified() {
+        let identity = "7:a-b-dev/14527b3cbdf37376ceb9eda41d2afac4";
+        assert_eq!(
+            classify_legacy_owners([None, None, None, None], identity),
+            LegacyAdoption::NotAdopted
+        );
+        assert_eq!(
+            classify_legacy_owners(
+                [
+                    Some(identity),
+                    Some(identity),
+                    Some(identity),
+                    Some(identity)
+                ],
+                identity
+            ),
+            LegacyAdoption::Verified
+        );
+        assert_eq!(
+            classify_legacy_owners([Some(""), Some(""), Some(""), Some("")], identity),
+            LegacyAdoption::Unverified
+        );
+        assert_eq!(
+            classify_legacy_owners([Some(""), Some(identity), None, Some("")], identity),
+            LegacyAdoption::Unverified
+        );
+        assert_eq!(
+            classify_legacy_owners([Some(""), Some("3:a b/dev"), None, None], identity),
+            LegacyAdoption::NotAdopted
+        );
+        assert_eq!(
+            classify_legacy_owners(
+                [
+                    Some(identity),
+                    Some(identity),
+                    Some(identity),
+                    Some("3:a b/dev")
+                ],
+                identity
+            ),
+            LegacyAdoption::NotAdopted
+        );
+    }
+
+    #[test]
+    fn unverified_warning_names_the_instance_and_docs() {
+        let message = legacy_unverified_warning("dev", "helix-demo-dev-abc123");
+        assert!(message.contains("could not be verified"));
+        assert!(message.contains("helix-demo-dev-abc123"));
+        assert!(message.contains(LEGACY_UNVERIFIED_DOCS_URL));
     }
 
     #[test]
